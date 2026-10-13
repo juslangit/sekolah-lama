@@ -1,0 +1,749 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><Item class="ReplicatedStorage" referent="RBX2"><Properties><string name="Name">ReplicatedStorage</string></Properties><Item class="ModuleScript" referent="RBX1"><Properties><string name="Name">Config</string><ProtectedString name="Source"><![CDATA[-- Shared game values. Balance the game here, not in the scripts.
+local Config = {}
+
+-- School layout in studs. Classrooms line both sides of one corridor that runs along X from 0.
+-- The lobby sits before X = 0 and is the safe zone: the ghost never enters it.
+Config.RoomsPerSide = 4
+Config.RoomWidth = 36
+Config.RoomDepth = 30
+Config.CorridorWidth = 14
+Config.WallHeight = 14
+Config.DoorWidth = 6
+Config.DoorHeight = 9
+Config.LobbyLength = 30
+Config.LobbyWidth = 30
+Config.GateWidth = 8
+
+-- Talismans to find before the gate opens. At most one per classroom, so keep it
+-- at or below RoomsPerSide * 2.
+Config.TalismanCount = 5
+
+Config.WalkSpeed = 10
+Config.SprintSpeed = 20
+Config.StaminaSeconds = 5 -- how long a full bar lasts
+Config.StaminaRegen = 0.5 -- stamina seconds regained per second
+Config.StaminaRecover = 1 -- stamina needed to sprint again after running out
+
+Config.FirstPerson = true
+Config.RespawnTime = 3
+Config.RoundRestartTime = 8
+
+-- The ghost floats through walls. Walls block her sight but not her hearing:
+-- anyone moving faster than a walk inside HearRadius is noticed.
+-- Keep ChaseSpeed between WalkSpeed and SprintSpeed so running works only while stamina lasts.
+Config.Ghost = {
+	PatrolSpeed = 7,
+	ChaseSpeed = 16,
+	SightRadius = 70,
+	HearRadius = 45,
+	CatchRadius = 4,
+	LoseTime = 4, -- seconds she keeps following after losing a player
+	RestTime = 3, -- pause after a catch
+	DreadRadius = 60, -- distance at which the screen starts to redden
+}
+
+return Config
+]]></ProtectedString></Properties></Item></Item><Item class="ServerScriptService" referent="RBX6"><Properties><string name="Name">ServerScriptService</string></Properties><Item class="ModuleScript" referent="RBX3"><Properties><string name="Name">World</string><ProtectedString name="Source"><![CDATA[-- Builds the grey-box school from Config so no manual building is needed yet.
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+
+local World = {}
+
+local HEIGHT = Config.WallHeight
+local HALF_CORRIDOR = Config.CorridorWidth / 2
+local OUTER = HALF_CORRIDOR + Config.RoomDepth
+local LENGTH = Config.RoomsPerSide * Config.RoomWidth
+local HALF_LOBBY = Config.LobbyWidth / 2
+local HALF_GATE = Config.GateWidth / 2
+local HALF_DOOR = Config.DoorWidth / 2
+local HALF_WALL = 0.5
+local PORCH = 12 -- floor past the gate
+local DESK_HEIGHT = 3
+
+local WALL_COLOR = Color3.fromRGB(104, 108, 92)
+local FLOOR_COLOR = Color3.fromRGB(70, 66, 60)
+local CEILING_COLOR = Color3.fromRGB(50, 50, 48)
+local DESK_COLOR = Color3.fromRGB(96, 70, 48)
+local GATE_COLOR = Color3.fromRGB(90, 30, 28)
+local LAMP_COLOR = Color3.fromRGB(255, 214, 150)
+local TALISMAN_COLOR = Color3.fromRGB(240, 205, 80)
+
+local random = Random.new()
+
+local function newPart(parent, name, size, cframe, color, material)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Size = size
+	part.CFrame = cframe
+	part.Color = color
+	part.Material = material or Enum.Material.SmoothPlastic
+	part.Parent = parent
+	return part
+end
+
+-- Fills the box between two corners. Every wall, floor and desk is made this way.
+local function box(parent, name, x0, x1, y0, y1, z0, z1, color, material)
+	local size = Vector3.new(math.abs(x1 - x0), math.abs(y1 - y0), math.abs(z1 - z0))
+	local center = CFrame.new((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2)
+	return newPart(parent, name, size, center, color, material)
+end
+
+-- A wall running along X at the given z.
+local function wallX(parent, x0, x1, z, y0, y1)
+	return box(parent, "Wall", x0, x1, y0 or 0, y1 or HEIGHT, z - HALF_WALL, z + HALF_WALL, WALL_COLOR, Enum.Material.Concrete)
+end
+
+-- A wall running along Z at the given x.
+local function wallZ(parent, x, z0, z1, y0, y1)
+	return box(parent, "Wall", x - HALF_WALL, x + HALF_WALL, y0 or 0, y1 or HEIGHT, z0, z1, WALL_COLOR, Enum.Material.Concrete)
+end
+
+local function addLamp(parent, x, z, brightness, range)
+	local lamp = newPart(parent, "Lamp", Vector3.new(3, 0.4, 1), CFrame.new(x, HEIGHT - 0.2, z), LAMP_COLOR, Enum.Material.Neon)
+	lamp.CanCollide = false
+	local light = Instance.new("PointLight")
+	light.Color = LAMP_COLOR
+	light.Brightness = brightness
+	light.Range = range
+	light.Parent = lamp
+	return lamp
+end
+
+function World.build()
+	local map = Instance.new("Folder")
+	map.Name = "Map"
+	map.Parent = Workspace
+
+	local lobbyX = -Config.LobbyLength
+
+	box(map, "Floor", lobbyX - PORCH, LENGTH, -1, 0, -OUTER, OUTER, FLOOR_COLOR, Enum.Material.Concrete)
+	box(map, "Ceiling", lobbyX, LENGTH, HEIGHT, HEIGHT + 1, -OUTER, OUTER, CEILING_COLOR)
+
+	-- Shell: far end, both long sides, and the wall that separates the lobby from the classrooms.
+	wallZ(map, LENGTH, -OUTER, OUTER)
+	for _, side in { 1, -1 } do
+		wallX(map, 0, LENGTH, side * OUTER)
+		wallZ(map, 0, side * HALF_CORRIDOR, side * OUTER)
+		wallX(map, lobbyX, 0, side * HALF_LOBBY)
+		wallZ(map, lobbyX, side * HALF_GATE, side * HALF_LOBBY)
+	end
+	wallZ(map, lobbyX, -HALF_GATE, HALF_GATE, Config.DoorHeight, HEIGHT)
+
+	local gate = box(map, "Gate", lobbyX - HALF_WALL, lobbyX + HALF_WALL, 0, Config.DoorHeight, -HALF_GATE, HALF_GATE, GATE_COLOR, Enum.Material.Metal)
+
+	-- Touching this once the gate is open ends the round.
+	local escape = box(map, "Escape", lobbyX - PORCH, lobbyX - 3, 0, Config.DoorHeight, -HALF_LOBBY, HALF_LOBBY, GATE_COLOR)
+	escape.Transparency = 1
+	escape.CanCollide = false
+
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Name = "Spawn"
+	spawn.Anchored = true
+	spawn.Neutral = true
+	spawn.Duration = 0
+	spawn.Size = Vector3.new(8, 1, 8)
+	spawn.CFrame = CFrame.new(lobbyX / 2, 0.5, 0)
+	spawn.Color = FLOOR_COLOR
+	spawn.Material = Enum.Material.Concrete
+	spawn.TopSurface = Enum.SurfaceType.Smooth
+	spawn.Parent = map
+
+	addLamp(map, lobbyX / 2, 0, 0.8, 26)
+
+	local rooms = {}
+	local waypoints = {}
+
+	for index = 1, Config.RoomsPerSide do
+		local x0 = (index - 1) * Config.RoomWidth
+		local x1 = index * Config.RoomWidth
+		local centerX = (x0 + x1) / 2
+
+		table.insert(waypoints, Vector3.new(centerX, 0, 0))
+		if index % 2 == 1 then
+			addLamp(map, centerX, 0, 0.5, 22)
+		end
+
+		for _, side in { 1, -1 } do
+			-- Corridor wall with a doorway in the middle.
+			local doorZ = side * HALF_CORRIDOR
+			wallX(map, x0, centerX - HALF_DOOR, doorZ)
+			wallX(map, centerX + HALF_DOOR, x1, doorZ)
+			wallX(map, centerX - HALF_DOOR, centerX + HALF_DOOR, doorZ, Config.DoorHeight, HEIGHT)
+
+			if index < Config.RoomsPerSide then
+				wallZ(map, x1, side * HALF_CORRIDOR, side * OUTER)
+			end
+
+			-- Desks. Their tops are where talismans can appear.
+			local spots = {}
+			for column = -1, 1 do
+				for row = 1, 2 do
+					local x = centerX + column * 9
+					local z = side * (HALF_CORRIDOR + row * Config.RoomDepth / 3)
+					box(map, "Desk", x - 2, x + 2, 0, DESK_HEIGHT, z - 1.25, z + 1.25, DESK_COLOR, Enum.Material.Wood)
+					table.insert(spots, Vector3.new(x, DESK_HEIGHT, z))
+				end
+			end
+
+			local center = Vector3.new(centerX, 0, side * (HALF_CORRIDOR + Config.RoomDepth / 2))
+			table.insert(rooms, { center = center, spots = spots })
+			table.insert(waypoints, center)
+		end
+	end
+
+	local talismans = Instance.new("Folder")
+	talismans.Name = "Talismans"
+	talismans.Parent = map
+
+	return {
+		map = map,
+		gate = gate,
+		escape = escape,
+		rooms = rooms,
+		waypoints = waypoints,
+		talismans = talismans,
+		length = LENGTH,
+	}
+end
+
+function World.setGate(world, open)
+	world.gate.CanCollide = not open
+	world.gate.Transparency = open and 1 or 0
+end
+
+-- Clears the old talismans and places new ones, one per randomly chosen classroom.
+function World.spawnTalismans(world)
+	world.talismans:ClearAllChildren()
+
+	local rooms = table.clone(world.rooms)
+	for index = #rooms, 2, -1 do
+		local other = random:NextInteger(1, index)
+		rooms[index], rooms[other] = rooms[other], rooms[index]
+	end
+
+	local placed = {}
+	for index = 1, math.min(Config.TalismanCount, #rooms) do
+		local spots = rooms[index].spots
+		local spot = spots[random:NextInteger(1, #spots)]
+
+		local talisman = newPart(world.talismans, "Talisman", Vector3.new(1, 0.1, 1.6), CFrame.new(spot + Vector3.new(0, 0.05, 0)), TALISMAN_COLOR, Enum.Material.Neon)
+		talisman.CanCollide = false
+
+		local glow = Instance.new("PointLight")
+		glow.Color = TALISMAN_COLOR
+		glow.Brightness = 0.6
+		glow.Range = 7
+		glow.Parent = talisman
+
+		local prompt = Instance.new("ProximityPrompt")
+		prompt.ActionText = "Take"
+		prompt.ObjectText = "Talisman"
+		prompt.HoldDuration = 0.5
+		prompt.MaxActivationDistance = 8
+		prompt.RequiresLineOfSight = false
+		prompt.Parent = talisman
+
+		table.insert(placed, talisman)
+	end
+	return placed
+end
+
+return World
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX4"><Properties><string name="Name">Ghost</string><ProtectedString name="Source"><![CDATA[-- The ghost. She drifts between waypoints, straight through walls, and chases anyone she sees or hears.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+
+local Ghost = {}
+
+local SETTINGS = Config.Ghost
+local FLOAT_HEIGHT = 3.5
+local EYE_OFFSET = Vector3.new(0, 2, 0)
+local LOOK_INTERVAL = 0.2 -- seconds between detection checks
+local RUN_MARGIN = 2 -- speed above a walk that counts as noise
+local MIN_X = 4 -- keeps her out of the lobby
+
+local random = Random.new()
+
+local function newPiece(model, name, size, offset, color, material, transparency)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Size = size
+	part.CFrame = CFrame.new(offset)
+	part.Color = color
+	part.Material = material
+	part.Transparency = transparency
+	part.Parent = model
+	return part
+end
+
+-- Built around the origin facing -Z, which is the direction CFrame.lookAt points her.
+local function buildModel()
+	local model = Instance.new("Model")
+	model.Name = "Ghost"
+
+	local white = Color3.fromRGB(225, 225, 220)
+	local black = Color3.fromRGB(12, 12, 12)
+	local red = Color3.fromRGB(255, 30, 30)
+
+	local body = newPiece(model, "Body", Vector3.new(2.5, 6, 1.5), Vector3.new(0, 0, 0), white, Enum.Material.SmoothPlastic, 0.25)
+	newPiece(model, "Hair", Vector3.new(2.8, 3.6, 1.6), Vector3.new(0, 1.8, 0.3), black, Enum.Material.SmoothPlastic, 0)
+	newPiece(model, "Face", Vector3.new(1.6, 1.6, 0.3), Vector3.new(0, 2, -0.7), white, Enum.Material.SmoothPlastic, 0)
+	newPiece(model, "EyeLeft", Vector3.new(0.3, 0.2, 0.1), Vector3.new(-0.4, 2.2, -0.88), red, Enum.Material.Neon, 0)
+	newPiece(model, "EyeRight", Vector3.new(0.3, 0.2, 0.1), Vector3.new(0.4, 2.2, -0.88), red, Enum.Material.Neon, 0)
+
+	local glow = Instance.new("PointLight")
+	glow.Color = red
+	glow.Brightness = 0.6
+	glow.Range = 10
+	glow.Parent = body
+
+	model.PrimaryPart = body
+	return model
+end
+
+-- Starts the ghost. onCatch(player) runs each time she catches someone.
+function Ghost.start(world, onCatch)
+	local model = buildModel()
+	local position = Vector3.new(world.length - 10, FLOAT_HEIGHT, 0)
+	model:PivotTo(CFrame.new(position))
+	model.Parent = Workspace
+
+	local function randomWaypoint()
+		return world.waypoints[random:NextInteger(1, #world.waypoints)]
+	end
+
+	local destination = randomWaypoint()
+	local target = nil
+	local lastNoticed = 0
+	local restUntil = 0
+	local nextLook = 0
+
+	local function setTarget(player)
+		if target ~= player then
+			target = player
+			model:SetAttribute("Chasing", player ~= nil)
+		end
+	end
+
+	-- The living character of a player who is past the lobby, or nil.
+	local function rootOf(player)
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if root and humanoid and humanoid.Health > 0 and root.Position.X > 0 then
+			return root, humanoid
+		end
+		return nil
+	end
+
+	-- Nearest player she can hear running or see in a straight line.
+	local function detect()
+		local eye = position + EYE_OFFSET
+		local best, bestDistance
+		for _, player in Players:GetPlayers() do
+			local root = rootOf(player)
+			if root then
+				local offset = root.Position - eye
+				local distance = offset.Magnitude
+				local noticed = false
+
+				if distance <= SETTINGS.HearRadius then
+					local velocity = root.AssemblyLinearVelocity
+					noticed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude > Config.WalkSpeed + RUN_MARGIN
+				end
+				if not noticed and distance <= SETTINGS.SightRadius then
+					local hit = Workspace:Raycast(eye, offset)
+					noticed = hit == nil or hit.Instance:IsDescendantOf(player.Character)
+				end
+
+				if noticed and (not bestDistance or distance < bestDistance) then
+					best, bestDistance = player, distance
+				end
+			end
+		end
+		return best
+	end
+
+	RunService.Heartbeat:Connect(function(dt)
+		local now = os.clock()
+		if now < restUntil then
+			return
+		end
+
+		if now >= nextLook then
+			nextLook = now + LOOK_INTERVAL
+			local noticed = detect()
+			if noticed then
+				setTarget(noticed)
+				lastNoticed = now
+			elseif target and now - lastNoticed > SETTINGS.LoseTime then
+				setTarget(nil)
+				destination = randomWaypoint()
+			end
+		end
+
+		local root, humanoid
+		if target then
+			root, humanoid = rootOf(target)
+		end
+
+		local goal = root and root.Position or destination
+		local flat = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z)
+		local distance = flat.Magnitude
+
+		if root and distance <= SETTINGS.CatchRadius then
+			local caught = target
+			humanoid.Health = 0
+			setTarget(nil)
+			restUntil = now + SETTINGS.RestTime
+			destination = randomWaypoint()
+			onCatch(caught)
+			return
+		end
+
+		if distance < 1 then
+			if not root then
+				destination = randomWaypoint()
+			end
+			return
+		end
+
+		local speed = target and SETTINGS.ChaseSpeed or SETTINGS.PatrolSpeed
+		local direction = flat.Unit
+		local step = math.min(distance, speed * dt)
+		local x = math.clamp(position.X + direction.X * step, MIN_X, world.length - 2)
+		position = Vector3.new(x, FLOAT_HEIGHT, position.Z + direction.Z * step)
+		model:PivotTo(CFrame.lookAt(position, position + direction))
+	end)
+
+	return model
+end
+
+return Ghost
+]]></ProtectedString></Properties></Item><Item class="Script" referent="RBX5"><Properties><string name="Name">Main</string><ProtectedString name="Source"><![CDATA[-- Round rules. The server owns the talisman count, the gate and the ghost; clients only walk and trigger prompts.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local StarterPlayer = game:GetService("StarterPlayer")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+local World = require(script.Parent:WaitForChild("World"))
+local Ghost = require(script.Parent:WaitForChild("Ghost"))
+
+local notifyEvent = Instance.new("RemoteEvent")
+notifyEvent.Name = "Notify"
+notifyEvent.Parent = ReplicatedStorage
+
+local scareEvent = Instance.new("RemoteEvent")
+scareEvent.Name = "Scare"
+scareEvent.Parent = ReplicatedStorage
+
+-- Pitch-black night. The only light comes from lamps, talismans and flashlights.
+local BLACK = Color3.new(0, 0, 0)
+Lighting.ClockTime = 0
+Lighting.Brightness = 0
+Lighting.Ambient = BLACK
+Lighting.OutdoorAmbient = BLACK
+Lighting.EnvironmentDiffuseScale = 0
+Lighting.EnvironmentSpecularScale = 0
+Lighting.GlobalShadows = true
+Lighting.FogColor = BLACK
+Lighting.FogStart = 10
+Lighting.FogEnd = 120
+
+StarterPlayer.CharacterWalkSpeed = Config.WalkSpeed
+Players.RespawnTime = Config.RespawnTime
+
+local world = World.build()
+
+local found = 0
+local roundOver = false
+
+local function notifyAll(message)
+	notifyEvent:FireAllClients(message)
+end
+
+local function startRound()
+	found = 0
+	roundOver = false
+	World.setGate(world, false)
+	Workspace:SetAttribute("Talismans", 0)
+
+	for _, talisman in World.spawnTalismans(world) do
+		talisman:FindFirstChildOfClass("ProximityPrompt").Triggered:Connect(function(player)
+			if roundOver or not talisman.Parent then
+				return
+			end
+			talisman:Destroy()
+			found += 1
+			Workspace:SetAttribute("Talismans", found)
+
+			if found >= Config.TalismanCount then
+				World.setGate(world, true)
+				notifyAll(player.DisplayName .. " found the last talisman. The gate is open - run!")
+			else
+				notifyAll(player.DisplayName .. " found a talisman.")
+			end
+		end)
+	end
+end
+
+-- The first player through the open gate wins the round for everyone.
+world.escape.Touched:Connect(function(hit)
+	local player = Players:GetPlayerFromCharacter(hit.Parent)
+	if not player or roundOver or found < Config.TalismanCount then
+		return
+	end
+	roundOver = true
+	notifyAll(player.DisplayName .. " escaped! A new night begins soon.")
+
+	task.delay(Config.RoundRestartTime, function()
+		startRound()
+		for _, other in Players:GetPlayers() do
+			other:LoadCharacter()
+		end
+	end)
+end)
+
+local function onPlayerAdded(player)
+	if Config.FirstPerson then
+		player.CameraMode = Enum.CameraMode.LockFirstPerson
+	end
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in Players:GetPlayers() do
+	onPlayerAdded(player)
+end
+
+startRound()
+
+Ghost.start(world, function(player)
+	scareEvent:FireClient(player)
+end)
+]]></ProtectedString></Properties></Item></Item><Item class="StarterPlayer" referent="RBX11"><Properties><string name="Name">StarterPlayer</string></Properties><Item class="StarterPlayerScripts" referent="RBX10"><Properties><string name="Name">StarterPlayerScripts</string></Properties><Item class="LocalScript" referent="RBX7"><Properties><string name="Name">Hud</string><ProtectedString name="Source"><![CDATA[-- Talisman counter, messages, the red dread tint near the ghost, and the catch screen.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+local notifyEvent = ReplicatedStorage:WaitForChild("Notify")
+local scareEvent = ReplicatedStorage:WaitForChild("Scare")
+
+local player = Players.LocalPlayer
+
+local MESSAGE_TIME = 4
+local SCARE_TIME = 1.5
+local MAX_DREAD = 0.45 -- strongest tint, when the ghost is on top of you
+
+local WHITE = Color3.fromRGB(255, 255, 255)
+local RED = Color3.fromRGB(170, 0, 0)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "Hud"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local function newLabel(name, position, size, color)
+	local label = Instance.new("TextLabel")
+	label.Name = name
+	label.AnchorPoint = Vector2.new(0.5, 0)
+	label.Position = position
+	label.Size = size
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextScaled = true
+	label.TextColor3 = color
+	label.TextStrokeTransparency = 0
+	label.Text = ""
+	label.Parent = gui
+	return label
+end
+
+local dread = Instance.new("Frame")
+dread.Name = "Dread"
+dread.Size = UDim2.fromScale(1, 1)
+dread.BackgroundColor3 = RED
+dread.BackgroundTransparency = 1
+dread.BorderSizePixel = 0
+dread.Parent = gui
+
+local counter = newLabel("Counter", UDim2.fromScale(0.5, 0.06), UDim2.fromScale(0.3, 0.05), WHITE)
+local message = newLabel("Message", UDim2.fromScale(0.5, 0.13), UDim2.fromScale(0.6, 0.04), WHITE)
+
+local scare = Instance.new("TextLabel")
+scare.Name = "Scare"
+scare.Size = UDim2.fromScale(1, 1)
+scare.BackgroundColor3 = Color3.new(0, 0, 0)
+scare.BorderSizePixel = 0
+scare.Font = Enum.Font.GothamBlack
+scare.TextScaled = true
+scare.TextColor3 = RED
+scare.Text = "SHE FOUND YOU"
+scare.Visible = false
+scare.ZIndex = 10
+scare.Parent = gui
+
+local function updateCounter()
+	local found = Workspace:GetAttribute("Talismans") or 0
+	counter.Text = string.format("Talismans %d / %d", found, Config.TalismanCount)
+end
+
+local messageId = 0
+local function showMessage(text)
+	messageId += 1
+	local id = messageId
+	message.Text = text
+	task.delay(MESSAGE_TIME, function()
+		if messageId == id then
+			message.Text = ""
+		end
+	end)
+end
+
+Workspace:GetAttributeChangedSignal("Talismans"):Connect(updateCounter)
+updateCounter()
+
+notifyEvent.OnClientEvent:Connect(showMessage)
+
+scareEvent.OnClientEvent:Connect(function()
+	scare.Visible = true
+	task.delay(SCARE_TIME, function()
+		scare.Visible = false
+	end)
+end)
+
+RunService.RenderStepped:Connect(function()
+	local ghost = Workspace:FindFirstChild("Ghost")
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not ghost or not root then
+		dread.BackgroundTransparency = 1
+		return
+	end
+	local distance = (ghost:GetPivot().Position - root.Position).Magnitude
+	local closeness = math.clamp(1 - distance / Config.Ghost.DreadRadius, 0, 1)
+	dread.BackgroundTransparency = 1 - closeness * MAX_DREAD
+end)
+
+showMessage("Find the talismans to open the gate. Walk quietly - she hears you run.")
+]]></ProtectedString></Properties></Item><Item class="LocalScript" referent="RBX8"><Properties><string name="Name">Sprint</string><ProtectedString name="Source"><![CDATA[-- Hold Left Shift (or the Run button on touch) to sprint while stamina lasts.
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+
+local player = Players.LocalPlayer
+
+local stamina = Config.StaminaSeconds
+local wantsSprint = false
+local exhausted = false -- set when the bar empties; blocks sprinting until it recovers a little
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "Stamina"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local bar = Instance.new("Frame")
+bar.Name = "Bar"
+bar.AnchorPoint = Vector2.new(0.5, 1)
+bar.Position = UDim2.fromScale(0.5, 0.95)
+bar.Size = UDim2.fromScale(0.2, 0.012)
+bar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+bar.BackgroundTransparency = 0.4
+bar.BorderSizePixel = 0
+bar.Parent = gui
+
+local fill = Instance.new("Frame")
+fill.Name = "Fill"
+fill.Size = UDim2.fromScale(1, 1)
+fill.BackgroundColor3 = Color3.fromRGB(230, 230, 220)
+fill.BorderSizePixel = 0
+fill.Parent = bar
+
+ContextActionService:BindAction("Sprint", function(_, state)
+	wantsSprint = state == Enum.UserInputState.Begin
+	return Enum.ContextActionResult.Pass
+end, true, Enum.KeyCode.LeftShift)
+ContextActionService:SetTitle("Sprint", "Run")
+
+RunService.RenderStepped:Connect(function(dt)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+
+	local moving = humanoid.MoveDirection.Magnitude > 0
+	local sprinting = wantsSprint and moving and not exhausted
+
+	if sprinting then
+		stamina = math.max(0, stamina - dt)
+		if stamina == 0 then
+			exhausted = true
+		end
+	else
+		stamina = math.min(Config.StaminaSeconds, stamina + Config.StaminaRegen * dt)
+		if stamina >= Config.StaminaRecover then
+			exhausted = false
+		end
+	end
+
+	humanoid.WalkSpeed = sprinting and Config.SprintSpeed or Config.WalkSpeed
+	fill.Size = UDim2.fromScale(stamina / Config.StaminaSeconds, 1)
+end)
+]]></ProtectedString></Properties></Item><Item class="LocalScript" referent="RBX9"><Properties><string name="Name">Flashlight</string><ProtectedString name="Source"><![CDATA[-- A flashlight that follows the camera. Press F (or the Light button on touch) to toggle it.
+-- The light exists only on this client, so other players do not see it yet.
+local ContextActionService = game:GetService("ContextActionService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local lamp = Instance.new("Part")
+lamp.Name = "Flashlight"
+lamp.Anchored = true
+lamp.CanCollide = false
+lamp.CanQuery = false
+lamp.CanTouch = false
+lamp.Transparency = 1
+lamp.Size = Vector3.new(0.2, 0.2, 0.2)
+lamp.Parent = Workspace
+
+local light = Instance.new("SpotLight")
+light.Face = Enum.NormalId.Front
+light.Angle = 60
+light.Range = 50
+light.Brightness = 2
+light.Shadows = true
+light.Parent = lamp
+
+ContextActionService:BindAction("Flashlight", function(_, state)
+	if state == Enum.UserInputState.Begin then
+		light.Enabled = not light.Enabled
+	end
+	return Enum.ContextActionResult.Sink
+end, true, Enum.KeyCode.F)
+ContextActionService:SetTitle("Flashlight", "Light")
+
+RunService.RenderStepped:Connect(function()
+	lamp.CFrame = Workspace.CurrentCamera.CFrame
+end)
+]]></ProtectedString></Properties></Item></Item></Item></roblox>
